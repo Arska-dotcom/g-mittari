@@ -39,7 +39,7 @@ enum class AccelUnit(val label: String) {
 }
 
 private const val GRAVITY_MPS2 = 9.80665f
-private const val STATIONARY_THRESHOLD_MPS2 = 0.45f
+private const val STATIONARY_THRESHOLD_MPS2 = 0.40f
 
 @Composable
 fun GForceMeterScreen(
@@ -64,7 +64,6 @@ fun GForceMeterScreen(
         // Keskialueen kiihtyvyysmittari (Canvas)
         Canvas(modifier = Modifier.fillMaxSize()) {
             val center = Offset(size.width / 2f, size.height / 2f + 18.dp.toPx())
-            // Skaalataan kehä niin, että sivuille jää tilaa Max G- ja 0–100-korteille
             val maxRadius = min(size.width * 0.25f, size.height * 0.37f)
 
             drawReferenceGrid(center, maxRadius)
@@ -152,7 +151,7 @@ fun GForceMeterScreen(
             }
         }
 
-        // YLÄPALKKI: Kalibrointi + GPS-tila vasemmalla | GPS-nopeus keskellä | Asetukset oikealla
+        // YLÄPALKKI: Kalibrointi + tilatiedot vasemmalla | GPS-nopeus keskellä | Asetukset oikealla
         Row(
             modifier = Modifier
                 .fillMaxWidth()
@@ -167,18 +166,21 @@ fun GForceMeterScreen(
                 OutlinedButton(
                     onClick = onCalibrate,
                     shape = RoundedCornerShape(10.dp),
-                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
+                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp),
                     colors = ButtonDefaults.outlinedButtonColors(
                         contentColor = Color(0xFFE2E8F0)
                     )
                 ) {
                     Icon(
                         imageVector = Icons.Default.MyLocation,
-                        contentDescription = "Kalibroi",
-                        modifier = Modifier.size(16.dp)
+                        contentDescription = "Kalibroi nyt",
+                        modifier = Modifier.size(15.dp)
                     )
-                    Spacer(Modifier.width(6.dp))
-                    Text("Kalibroi", fontSize = 13.sp)
+                    Spacer(Modifier.width(5.dp))
+                    Text(
+                        text = if (telemetry.isCalibrated) "Kalibroitu" else "Kalibroi",
+                        fontSize = 12.sp
+                    )
                 }
 
                 Surface(
@@ -292,7 +294,7 @@ fun GForceMeterScreen(
                     onClick = onResetMaxG,
                     modifier = Modifier
                         .fillMaxWidth()
-                        .height(32.dp),
+                        .height(34.dp),
                     contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp),
                     shape = RoundedCornerShape(8.dp),
                     colors = ButtonDefaults.outlinedButtonColors(contentColor = Color(0xFFCBD5E1))
@@ -308,11 +310,11 @@ fun GForceMeterScreen(
             }
         }
 
-        // OIKEA KORTTI: 0–100 km/h -kiihtyvyysmittari
+        // OIKEA KORTTI: 0–100 km/h -kiihtyvyysmittari + Nollaus
         val (statusText, statusColor) = when (telemetry.sprintState) {
-            SprintState.WAITING_FOR_STOP -> "Pysäytä auto" to Color(0xFF94A3B8)
+            SprintState.WAITING_FOR_STOP -> "Pysäytä" to Color(0xFF94A3B8)
             SprintState.READY -> "VALMIS" to Color(0xFF22C55E)
-            SprintState.RUNNING -> "MITATAAN..." to Color(0xFFF59E0B)
+            SprintState.RUNNING -> "MITATAAN" to Color(0xFFF59E0B)
             SprintState.FINISHED -> "TULOS" to Color(0xFF38BDF8)
         }
 
@@ -388,7 +390,7 @@ fun GForceMeterScreen(
                     onClick = onResetSprint,
                     modifier = Modifier
                         .fillMaxWidth()
-                        .height(32.dp),
+                        .height(34.dp),
                     contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp),
                     shape = RoundedCornerShape(8.dp),
                     colors = ButtonDefaults.outlinedButtonColors(contentColor = Color(0xFFCBD5E1))
