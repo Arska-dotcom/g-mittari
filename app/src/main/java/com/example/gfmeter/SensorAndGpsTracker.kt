@@ -16,6 +16,7 @@ import android.view.WindowManager
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlin.math.abs
 import kotlin.math.sqrt
 
 enum class SprintState {
@@ -46,15 +47,22 @@ class SensorAndGpsTracker(private val context: Context) : SensorEventListener, L
     private val _state = MutableStateFlow(TelemetryState())
     val state: StateFlow<TelemetryState> = _state.asStateFlow()
 
-    // Kalibroitu painovoimavektori
+    // Kalibroitu painovoimavektori (puhelimen koordinaatistossa)
     private var gravityBaseline: FloatArray? = null
     private var lastRawAccel = FloatArray(3)
+    private var prevRawAccel = FloatArray(3)
+    private var hasPrevSample = false
     private var ignorePeakUntilNanos: Long = 0L
+
+    // Automaattisen kalibroinnin vakaustarkkailu
+    private var steadySinceNanos: Long = 0L
+    private var steadySum = FloatArray(3)
+    private var steadyCount = 0
 
     // Alipäästösuodatetut arvot (m/s^2)
     private var filteredX = 0f
     private var filteredY = 0f
-    private val smoothingAlpha = 0.16f
+    private val smoothingAlpha = 0.18f
 
     // 0–100 km/h ajastimen sisäiset muuttujat
     private var stationarySinceNanos: Long = 0L
@@ -78,7 +86,7 @@ class SensorAndGpsTracker(private val context: Context) : SensorEventListener, L
             if (locationManager.isProviderEnabled(LocationManager.GPS_PROVIDER)) {
                 locationManager.requestLocationUpdates(
                     LocationManager.GPS_PROVIDER,
-                    200L, // Päivitysväli 200 ms (5 Hz)
+                    200L,
                     0f,
                     this
                 )
@@ -93,16 +101,23 @@ class SensorAndGpsTracker(private val context: Context) : SensorEventListener, L
     }
 
     /**
-     * Tallentaa nykyisen asennon nollakohdaksi (painovoimavektori).
+     * Manuaalinen pikanollaus nykyiseen asentoon.
      */
     fun calibrateZero() {
-        if (length(lastRawAccel) > 1f) {
+        val rawLen = length(lastRawAccel)
+        if (rawLen in 7.5f..12.0f) {
             gravityBaseline = lastRawAccel.copyOf()
             filteredX = 0f
             filteredY = 0f
-            // Ohitetaan 400 ms napin painalluksen aiheuttama tärähdys
-            ignorePeakUntilNanos = SystemClock.elapsedRealtimeNanos() + 400_000_000L
-            _state.value = _state.value.copy(isCalibrated = true)
+            steadyCount = 0
+            steadySinceNanos = 0L
+            ignorePeakUntilNanos = SystemClock.elapsedRealtimeNanos() + 450_000_000L
+            _state.value = _state.value.copy(
+                screenAccelX = 0f,
+                screenAccelY = 0f,
+                magnitudeMps2 = 0f,
+                isCalibrated = true
+            )
         }
     }
 
@@ -115,17 +130,18 @@ class SensorAndGpsTracker(private val context: Context) : SensorEventListener, L
     }
 
     /**
-     * Nollaa 0–100 km/h ajastimen uutta vetoa varten.
+     * Nollaa 0–100 km/h ajastimen uutta kiihtyvyyskoetta varten.
      */
     fun resetSprint() {
         stationarySinceNanos = 0L
         sprintStartNanos = 0L
-        val nextState = if (_state.value.hasGpsFix && _state.value.speedKmh < 2.0f) {
+        val current = _state.value
+        val nextState = if (current.speedKmh < 2.0f) {
             SprintState.READY
         } else {
             SprintState.WAITING_FOR_STOP
         }
-        _state.value = _state.value.copy(
+        _state.value = current.copy(
             sprintState = nextState,
             sprintTimeSec = 0f
         )
@@ -135,13 +151,90 @@ class SensorAndGpsTracker(private val context: Context) : SensorEventListener, L
         if (event.sensor.type != Sensor.TYPE_ACCELEROMETER) return
 
         val nowNanos = SystemClock.elapsedRealtimeNanos()
-        lastRawAccel = event.values.copyOf()
+        val raw = event.values.copyOf()
+        val rawLen = length(raw)
 
-        // Automaattinen alkukalibrointi ensimmäisestä näytteestä
-        if (gravityBaseline == null && length(lastRawAccel) > 1f) {
-            gravityBaseline = lastRawAccel.copyOf()
+        // Hylätään epärealistiset pudotus-/iskupiikit (> 3.5 g)
+        if (rawLen > 35.0f || rawLen < 1.0f) return
+
+        val jitter = if (hasPrevSample) {
+            sqrt(
+                (raw[0] - prevRawAccel[0]) * (raw[0] - prevRawAccel[0]) +
+                    (raw[1] - prevRawAccel[1]) * (raw[1] - prevRawAccel[1]) +
+                    (raw[2] - prevRawAccel[2]) * (raw[2] - prevRawAccel[2])
+            )
+        } else {
+            0f
+        }
+
+        prevRawAccel = raw.copyOf()
+        lastRawAccel = raw.copyOf()
+        hasPrevSample = true
+
+        val current = _state.value
+        val isGpsStopped = !current.hasGpsFix || current.speedKmh < 2.0f
+        val isPhysicallySteady = (rawLen in 8.3f..11.3f) && (jitter < 0.35f) && isGpsStopped
+
+        // AUTOMAATTINEN KALIBROINTI:
+        // Kun puhelin/auto on vakaasti paikallaan, kerätään keskiarvo ja päivitetään nollakohta.
+        if (isPhysicallySteady) {
+            if (steadySinceNanos == 0L) {
+                steadySinceNanos = nowNanos
+                steadySum = floatArrayOf(raw[0], raw[1], raw[2])
+                steadyCount = 1
+            } else {
+                steadySum[0] += raw[0]
+                steadySum[1] += raw[1]
+                steadySum[2] += raw[2]
+                steadyCount++
+
+                val steadyDurationMs = (nowNanos - steadySinceNanos) / 1_000_000L
+
+                // Alkukalibrointi 350 ms vakauden jälkeen tai uudelleenkalibrointi 1500 ms jälkeen
+                if ((gravityBaseline == null && steadyDurationMs >= 350L) ||
+                    (gravityBaseline != null && steadyDurationMs >= 1500L)
+                ) {
+                    val avgGravity = floatArrayOf(
+                        steadySum[0] / steadyCount,
+                        steadySum[1] / steadyCount,
+                        steadySum[2] / steadyCount
+                    )
+                    val prevBase = gravityBaseline
+                    val baseShift = if (prevBase != null) {
+                        sqrt(
+                            (avgGravity[0] - prevBase[0]) * (avgGravity[0] - prevBase[0]) +
+                                (avgGravity[1] - prevBase[1]) * (avgGravity[1] - prevBase[1]) +
+                                (avgGravity[2] - prevBase[2]) * (avgGravity[2] - prevBase[2])
+                        )
+                    } else {
+                        99f
+                    }
+
+                    gravityBaseline = avgGravity
+                    // Jos telineen kulma oli muuttunut selvästi, nollataan suodatetut arvot heti
+                    if (baseShift > 0.6f) {
+                        filteredX = 0f
+                        filteredY = 0f
+                        ignorePeakUntilNanos = nowNanos + 400_000_000L
+                    }
+                    _state.value = _state.value.copy(isCalibrated = true)
+
+                    // Nollataan laskuri seuraavaa automaattista tarkistusta varten
+                    steadySinceNanos = nowNanos
+                    steadySum = floatArrayOf(raw[0], raw[1], raw[2])
+                    steadyCount = 1
+                }
+            }
+        } else {
+            steadySinceNanos = 0L
+            steadyCount = 0
+        }
+
+        // Hätävarakalibrointi, jos sovellus avattiin kesken ajon eikä auto ole vielä pysähtynyt
+        if (gravityBaseline == null) {
+            val norm = normalize(raw) ?: return
+            gravityBaseline = floatArrayOf(norm[0] * 9.80665f, norm[1] * 9.80665f, norm[2] * 9.80665f)
             ignorePeakUntilNanos = nowNanos + 500_000_000L
-            _state.value = _state.value.copy(isCalibrated = true)
         }
 
         val g0 = gravityBaseline ?: return
@@ -149,12 +242,15 @@ class SensorAndGpsTracker(private val context: Context) : SensorEventListener, L
 
         // Dynaaminen kiihtyvyys (ilman painovoimaa)
         val dynAccel = floatArrayOf(
-            lastRawAccel[0] - g0[0],
-            lastRawAccel[1] - g0[1],
-            lastRawAccel[2] - g0[2]
+            raw[0] - g0[0],
+            raw[1] - g0[1],
+            raw[2] - g0[2]
         )
 
+        // Näytön oikea reuna puhelimen koordinaatistossa
         val screenRightRaw = getScreenRightVectorInPhoneCoords()
+
+        // Projisoidaan vaakatasoon (kohtisuoraan painovoimaa vastaan)
         val dotRightUp = dot(screenRightRaw, gNorm)
         val horizRightRaw = floatArrayOf(
             screenRightRaw[0] - dotRightUp * gNorm[0],
@@ -162,35 +258,51 @@ class SensorAndGpsTracker(private val context: Context) : SensorEventListener, L
             screenRightRaw[2] - dotRightUp * gNorm[2]
         )
         val eRight = normalize(horizRightRaw) ?: return
+
+        // Eteenpäin (tuulilasiin päin) osoittava vaakasuora yksikkövektori
         val eForward = cross(gNorm, eRight)
 
+        // Auton kiihtyvyyskomponentit:
+        // accelRight > 0 kun auto kääntyy/kiihtyy oikealle
+        // accelForward > 0 kun auto kiihdyttää eteenpäin
         val accelRight = dot(dynAccel, eRight)
         val accelForward = dot(dynAccel, eForward)
 
-        // Näytön koordinaatit (inertiaali- / G-voimasuunta)
+        // G-voiman (inertiaali) suunta näytöllä:
+        // - Käännös oikealle (accelRight > 0) -> nuoli VASEN (-X)
+        // - Käännös vasemmalle (accelRight < 0) -> nuoli OIKEA (+X)
+        // - Kiihdytys eteenpäin (accelForward > 0) -> nuoli ALAS (+Y)
+        // - Jarrutus (accelForward < 0) -> nuoli YLÖS (-Y)
         val targetScreenX = -accelRight
         val targetScreenY = accelForward
 
         filteredX += smoothingAlpha * (targetScreenX - filteredX)
         filteredY += smoothingAlpha * (targetScreenY - filteredY)
 
-        val mag = sqrt(filteredX * filteredX + filteredY * filteredY)
-        val current = _state.value
+        // Kuollut alue paikallaan ollessa (poistaa mikrovärinän)
+        val rawMag = sqrt(filteredX * filteredX + filteredY * filteredY)
+        val mag = if (rawMag < 0.35f) 0f else rawMag
 
-        // Päivitetään huippuarvo (Max G)
-        val newMaxMag = if (nowNanos > ignorePeakUntilNanos && mag > current.maxMagnitudeMps2) {
+        val latest = _state.value
+
+        // Päivitetään huippuarvo (Max G) vain kalibroidussa tilassa
+        val newMaxMag = if (
+            latest.isCalibrated &&
+            nowNanos > ignorePeakUntilNanos &&
+            mag > latest.maxMagnitudeMps2
+        ) {
             mag
         } else {
-            current.maxMagnitudeMps2
+            latest.maxMagnitudeMps2
         }
 
-        // 0–100 km/h ajastimen päivitys kiihtyvyysanturin tahdissa (~50 Hz)
-        var updatedSprintState = current.sprintState
-        var updatedSprintTime = current.sprintTimeSec
+        // 0–100 km/h ajastimen päivitys
+        var updatedSprintState = latest.sprintState
+        var updatedSprintTime = latest.sprintTimeSec
 
-        when (current.sprintState) {
+        when (latest.sprintState) {
             SprintState.READY -> {
-                // Käynnistetään kello välittömästi kun auto lähtee kiihdyttämään eteenpäin (> 1.35 m/s^2)
+                // Käynnistetään kello heti kun auto lähtee kiihdyttämään eteenpäin
                 if (accelForward > 1.35f) {
                     updatedSprintState = SprintState.RUNNING
                     sprintStartNanos = nowNanos
@@ -200,8 +312,7 @@ class SensorAndGpsTracker(private val context: Context) : SensorEventListener, L
 
             SprintState.RUNNING -> {
                 val elapsedSec = ((nowNanos - sprintStartNanos) / 1_000_000_000.0).toFloat()
-                // Virhelähdön esto: jos 2.0 s kohdalla GPS-nopeus on yhä alle 3 km/h, palataan READY-tilaan
-                if (elapsedSec > 2.0f && current.speedKmh < 3.0f) {
+                if (elapsedSec > 2.0f && latest.speedKmh < 3.0f) {
                     updatedSprintState = SprintState.READY
                     updatedSprintTime = 0f
                 } else {
@@ -212,9 +323,9 @@ class SensorAndGpsTracker(private val context: Context) : SensorEventListener, L
             else -> Unit
         }
 
-        _state.value = current.copy(
-            screenAccelX = filteredX,
-            screenAccelY = filteredY,
+        _state.value = latest.copy(
+            screenAccelX = if (mag == 0f) 0f else filteredX,
+            screenAccelY = if (mag == 0f) 0f else filteredY,
             magnitudeMps2 = mag,
             maxMagnitudeMps2 = newMaxMag,
             sprintState = updatedSprintState,
@@ -225,7 +336,6 @@ class SensorAndGpsTracker(private val context: Context) : SensorEventListener, L
     override fun onLocationChanged(location: Location) {
         val nowNanos = SystemClock.elapsedRealtimeNanos()
         val rawSpeedKmh = if (location.hasSpeed()) location.speed * 3.6f else 0f
-        // Suodatetaan GPS:n paikallaanolo-kohina (< 1.2 km/h -> 0.0 km/h)
         val speedKmh = if (rawSpeedKmh < 1.2f) 0f else rawSpeedKmh
 
         val current = _state.value
@@ -238,7 +348,6 @@ class SensorAndGpsTracker(private val context: Context) : SensorEventListener, L
                     if (stationarySinceNanos == 0L) {
                         stationarySinceNanos = nowNanos
                     } else if (nowNanos - stationarySinceNanos >= 1_000_000_000L) {
-                        // Auto on ollut paikallaan 1.0 sekunnin -> valmis lähtöön
                         updatedSprintState = SprintState.READY
                         updatedSprintTime = 0f
                     }
@@ -249,7 +358,6 @@ class SensorAndGpsTracker(private val context: Context) : SensorEventListener, L
 
             SprintState.READY -> {
                 if (speedKmh >= 2.5f) {
-                    // Varmistuskäynnistys GPS:stä, jos kiihtyvyys oli hyvin loiva
                     updatedSprintState = SprintState.RUNNING
                     sprintStartNanos = if (prevGpsNanos > 0L) prevGpsNanos else nowNanos
                     updatedSprintTime = ((nowNanos - sprintStartNanos) / 1_000_000_000.0).toFloat()
@@ -258,7 +366,6 @@ class SensorAndGpsTracker(private val context: Context) : SensorEventListener, L
 
             SprintState.RUNNING -> {
                 if (speedKmh >= 100.0f) {
-                    // Lineaarinen interpolaatio tarkalle 100.0 km/h ylityshetkelle
                     val exactCrossNanos = if (
                         prevGpsNanos > sprintStartNanos &&
                         speedKmh > prevGpsSpeedKmh &&
@@ -273,15 +380,12 @@ class SensorAndGpsTracker(private val context: Context) : SensorEventListener, L
                     updatedSprintTime = ((exactCrossNanos - sprintStartNanos) / 1_000_000_000.0).toFloat()
                     updatedSprintState = SprintState.FINISHED
                 } else if (speedKmh < 1.5f && (nowNanos - sprintStartNanos) > 2_500_000_000L) {
-                    // Kiihdytys keskeytettiin ja auto pysähtyi uudelleen
                     updatedSprintState = SprintState.READY
                     updatedSprintTime = 0f
                 }
             }
 
-            SprintState.FINISHED -> {
-                // Tulos pysyy näytöllä lukittuna, kunnes käyttäjä painaa Nollaa
-            }
+            SprintState.FINISHED -> Unit
         }
 
         prevGpsSpeedKmh = speedKmh
@@ -303,6 +407,11 @@ class SensorAndGpsTracker(private val context: Context) : SensorEventListener, L
 
     override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) = Unit
 
+    /**
+     * Palauttaa näytön oikealle osoittavan yksikkövektorin puhelimen anturikoordinaatistossa:
+     * - ROTATION_90 (normaali vaakataso, latausportti oikealla): -Y
+     * - ROTATION_270 (käänteinen vaakataso, latausportti vasemmalla): +Y
+     */
     private fun getScreenRightVectorInPhoneCoords(): FloatArray {
         val rotation = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             context.display?.rotation ?: Surface.ROTATION_90
@@ -313,8 +422,8 @@ class SensorAndGpsTracker(private val context: Context) : SensorEventListener, L
         }
 
         return when (rotation) {
-            Surface.ROTATION_90 -> floatArrayOf(0f, 1f, 0f)
-            Surface.ROTATION_270 -> floatArrayOf(0f, -1f, 0f)
+            Surface.ROTATION_90 -> floatArrayOf(0f, -1f, 0f)
+            Surface.ROTATION_270 -> floatArrayOf(0f, 1f, 0f)
             Surface.ROTATION_180 -> floatArrayOf(-1f, 0f, 0f)
             else -> floatArrayOf(1f, 0f, 0f)
         }
